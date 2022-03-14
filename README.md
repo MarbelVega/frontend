@@ -5,5 +5,4 @@
 Plataforma frontend base basada en NUXTJS - node16.14
 
 ### Documentación
-
 * [Manual de uso](./docs/use.md)
