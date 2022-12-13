@@ -1,4 +1,4 @@
-FROM node:lts-gallium
+FROM node:gallium
 RUN mkdir -p /usr/src/app
 WORKDIR /usr/src/app
 COPY package.json .
