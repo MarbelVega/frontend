@@ -3,7 +3,7 @@
 * Clone the project
 ```sh
 git clone https://github.com/MarbelVega/frontend.git
-cd backend
+cd frontend
 ```
 
 * Deploy container
