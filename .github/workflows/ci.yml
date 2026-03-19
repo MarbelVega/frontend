@@ -1,72 +1,337 @@
-name: ci
+name: CI Pipeline
 
 on:
   push:
-    branches:
-      - main
-      - master
+    branches: [main, master]
   pull_request:
-    branches:
-      - main
-      - master
+    branches: [main, master]
+
 jobs:
+  # ─────────────────────────────────────────────────────────────
+  # STAGE 1: Notificación inicial de inicio
+  # ─────────────────────────────────────────────────────────────
   notification:
-    name: NotificaciónTelegram
+    name: 📢 Notificación Inicio
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-      - name: Notify to Telegram
+      - name: Notify inicio a Telegram
         uses: appleboy/telegram-action@master
         with:
           to: ${{ secrets.NOTIFY_CHAT }}
           token: ${{ secrets.NOTIFY_SIGNKEY }}
           message: |
-            ${{ github.actor }} hizo un push a master/main:
-            Mensaje: 
-            ${{ github.event.commits[0].message }}
-            _______________________________________
-            Repositorio: ${{ github.repository }}
-  
-  deploy:
-    needs: [notification] 
+            🚀 *Pipeline iniciado*
+
+            👤 Actor: ${{ github.actor }}
+            📦 Repo: ${{ github.repository }}
+            🌿 Branch: ${{ github.ref_name }}
+            💬 Commit: ${{ github.event.commits[0].message }}
+            🔗 SHA: ${{ github.sha }}
+
+            ⏳ Ejecutando: Seguridad → Build → Deploy...
+
+  # ─────────────────────────────────────────────────────────────
+  # STAGE 2: Seguridad (SAST + Secrets + SCA)
+  # ─────────────────────────────────────────────────────────────
+  security:
+    name: 🔒 Seguridad (SAST + Secrets + SCA)
     runs-on: ubuntu-latest
+    needs: [notification]
+    outputs:
+      semgrep_total:    ${{ steps.parse_semgrep.outputs.semgrep_total }}
+      semgrep_critical: ${{ steps.parse_semgrep.outputs.semgrep_critical }}
+      semgrep_high:     ${{ steps.parse_semgrep.outputs.semgrep_high }}
+      secrets_total:     ${{ steps.parse_trufflehog.outputs.secrets_total }}
+      secrets_verified:  ${{ steps.parse_trufflehog.outputs.secrets_verified }}
+      secrets_unverified: ${{ steps.parse_trufflehog.outputs.secrets_unverified }}
+      trivy_critical:   ${{ steps.parse_trivy.outputs.trivy_critical }}
+      trivy_high:       ${{ steps.parse_trivy.outputs.trivy_high }}
+      trivy_medium:     ${{ steps.parse_trivy.outputs.trivy_medium }}
+      trivy_low:        ${{ steps.parse_trivy.outputs.trivy_low }}
+      trivy_total:      ${{ steps.parse_trivy.outputs.trivy_total }}
+      security_passed:  ${{ steps.security_gate.outputs.passed }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Crear directorio de resultados
+        run: mkdir -p results
+
+      # ── 1. SAST: Semgrep ──────────────────────────────────────
+      - name: 🔍 SAST con Semgrep
+        run: |
+          pip install semgrep --break-system-packages -q
+          semgrep --json --output results/semgrep.json --config=auto . || true
+
+      - name: Parsear resultados Semgrep
+        id: parse_semgrep
+        run: |
+          total=$(jq '.results | length' results/semgrep.json 2>/dev/null || echo "0")
+          critical=$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' results/semgrep.json 2>/dev/null || echo "0")
+          high=$(jq '[.results[] | select(.extra.severity == "WARNING")] | length' results/semgrep.json 2>/dev/null || echo "0")
+          echo "semgrep_total=$total"       >> $GITHUB_OUTPUT
+          echo "semgrep_critical=$critical" >> $GITHUB_OUTPUT
+          echo "semgrep_high=$high"         >> $GITHUB_OUTPUT
+
+      # ── 2. Secret Scan: TruffleHog ───────────────────────────
+      - name: 🔑 Secret Scan con TruffleHog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --results=verified,unknown
+        continue-on-error: true
+
+      - name: Capturar resultados TruffleHog
+        id: parse_trufflehog
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/repo" \
+            trufflesecurity/trufflehog:latest \
+            git file:///repo \
+            --results=verified,unknown \
+            --json 2>/dev/null \
+            | jq -s '.' > results/trufflehog.json || echo "[]" > results/trufflehog.json
+
+          verified=$(jq '[.[] | select(.Verified == true)] | length' results/trufflehog.json 2>/dev/null || echo "0")
+          unverified=$(jq '[.[] | select(.Verified == false)] | length' results/trufflehog.json 2>/dev/null || echo "0")
+          total=$(jq 'length' results/trufflehog.json 2>/dev/null || echo "0")
+          echo "secrets_verified=$verified"     >> $GITHUB_OUTPUT
+          echo "secrets_unverified=$unverified" >> $GITHUB_OUTPUT
+          echo "secrets_total=$total"           >> $GITHUB_OUTPUT
+
+      # ── 3. SCA: Trivy ────────────────────────────────────────
+      - name: 📦 SCA con Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          format: json
+          output: results/trivy.json
+          exit-code: '0'
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+
+      - name: Parsear resultados Trivy
+        id: parse_trivy
+        run: |
+          critical=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy.json 2>/dev/null || echo "0")
+          high=$(jq     '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")]     | length' results/trivy.json 2>/dev/null || echo "0")
+          medium=$(jq   '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")]   | length' results/trivy.json 2>/dev/null || echo "0")
+          low=$(jq      '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")]      | length' results/trivy.json 2>/dev/null || echo "0")
+          total=$(jq    '[.Results[]?.Vulnerabilities[]?] | length'                        results/trivy.json 2>/dev/null || echo "0")
+          echo "trivy_critical=$critical" >> $GITHUB_OUTPUT
+          echo "trivy_high=$high"         >> $GITHUB_OUTPUT
+          echo "trivy_medium=$medium"     >> $GITHUB_OUTPUT
+          echo "trivy_low=$low"           >> $GITHUB_OUTPUT
+          echo "trivy_total=$total"       >> $GITHUB_OUTPUT
+
+      # ── Security gate ─────────────────────────────────────────
+      - name: Evaluar security gate
+        id: security_gate
+        run: |
+          if [ "${{ steps.parse_semgrep.outputs.semgrep_critical }}" -gt 0 ] || \
+             [ "${{ steps.parse_trufflehog.outputs.secrets_verified }}" -gt 0 ] || \
+             [ "${{ steps.parse_trivy.outputs.trivy_critical }}" -gt 0 ]; then
+            echo "passed=false" >> $GITHUB_OUTPUT
+          else
+            echo "passed=true" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Summary en GitHub ─────────────────────────────────────
+      - name: 📊 Generar Summary
+        if: always()
+        run: |
+          status() { [ "$1" -eq 0 ] && echo "✅" || echo "⚠️"; }
+
+          PASSED="${{ steps.security_gate.outputs.passed }}"
+
+          if [ "$PASSED" = "true" ]; then
+            HEADER="### ✅ Pipeline limpio — sin hallazgos críticos"
+          else
+            HEADER="### ❌ Hallazgos críticos detectados — deploy bloqueado"
+          fi
+
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## 🔒 Security Report
+
+          ${HEADER}
+
+          ---
+
+          ### $(status ${{ steps.parse_semgrep.outputs.semgrep_critical }}) 1. SAST — Semgrep
+
+          | Severidad | Hallazgos |
+          |-----------|-----------|
+          | 🔴 Error (Critical) | ${{ steps.parse_semgrep.outputs.semgrep_critical }} |
+          | 🟡 Warning (High)   | ${{ steps.parse_semgrep.outputs.semgrep_high }} |
+          | 📋 Total            | ${{ steps.parse_semgrep.outputs.semgrep_total }} |
+
+          ---
+
+          ### $(status ${{ steps.parse_trufflehog.outputs.secrets_verified }}) 2. Secret Scanning — TruffleHog
+
+          | Estado | Cantidad |
+          |--------|----------|
+          | 🔴 Verificados (activos) | ${{ steps.parse_trufflehog.outputs.secrets_verified }} |
+          | 🟡 No verificados        | ${{ steps.parse_trufflehog.outputs.secrets_unverified }} |
+          | 📋 Total                 | ${{ steps.parse_trufflehog.outputs.secrets_total }} |
+
+          ---
+
+          ### $(status ${{ steps.parse_trivy.outputs.trivy_critical }}) 3. SCA — Trivy
+
+          | Severidad  | Cantidad |
+          |------------|----------|
+          | 🔴 Critical | ${{ steps.parse_trivy.outputs.trivy_critical }} |
+          | 🟠 High     | ${{ steps.parse_trivy.outputs.trivy_high }} |
+          | 🟡 Medium   | ${{ steps.parse_trivy.outputs.trivy_medium }} |
+          | 🔵 Low      | ${{ steps.parse_trivy.outputs.trivy_low }} |
+          | 📋 Total    | ${{ steps.parse_trivy.outputs.trivy_total }} |
+
+          ---
+
+          ### 📋 Resumen global
+
+          | Herramienta | Tipo    | Estado | Críticos | Total |
+          |-------------|---------|--------|----------|-------|
+          | Semgrep     | SAST    | $(status ${{ steps.parse_semgrep.outputs.semgrep_critical }}) | ${{ steps.parse_semgrep.outputs.semgrep_critical }} | ${{ steps.parse_semgrep.outputs.semgrep_total }} |
+          | TruffleHog  | Secrets | $(status ${{ steps.parse_trufflehog.outputs.secrets_verified }}) | ${{ steps.parse_trufflehog.outputs.secrets_verified }} | ${{ steps.parse_trufflehog.outputs.secrets_total }} |
+          | Trivy       | SCA     | $(status ${{ steps.parse_trivy.outputs.trivy_critical }}) | ${{ steps.parse_trivy.outputs.trivy_critical }} | ${{ steps.parse_trivy.outputs.trivy_total }} |
+
+          ---
+          🕐 $(date -u '+%Y-%m-%d %H:%M UTC') | Commit: \`${{ github.sha }}\` | Branch: \`${{ github.ref_name }}\`
+          EOF
+
+  # ─────────────────────────────────────────────────────────────
+  # STAGE 3: Build & Deploy a DockerHub
+  # ─────────────────────────────────────────────────────────────
+  deploy:
+    name: 🚀 Build & Deploy DockerHub
+    runs-on: ubuntu-latest
+    needs: [security]
+    # Solo en push a main/master Y si el security gate pasó
+    if: |
+      github.event_name == 'push' &&
+      needs.security.outputs.security_passed == 'true'
+
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v1
+        uses: docker/setup-qemu-action@v3
 
-      - name: Install docker
-        uses: docker/setup-buildx-action@v1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Login to DockerHub
-        uses: docker/login-action@v1 
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-          
-      - name: set lower case repo name
-        run: |
-          echo "REPO_LC=${REPO,,}" >>${GITHUB_ENV}
+
+      - name: Set lower case repo name
+        run: echo "REPO_LC=${REPO,,}" >> $GITHUB_ENV
         env:
           REPO: '${{ github.event.repository.name }}'
 
       - name: Build and push
         id: docker_build
-        uses: docker/build-push-action@v2
+        uses: docker/build-push-action@v5
         with:
           push: true
-          tags:  ${{ secrets.DOCKER_USERNAME }}/${{env.REPO_LC}}:${{ github.sha }},${{ secrets.DOCKER_USERNAME }}/${{env.REPO_LC}}:latest
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/${{ env.REPO_LC }}:${{ github.sha }}
+            ${{ secrets.DOCKER_USERNAME }}/${{ env.REPO_LC }}:latest
 
-      - name: Update repo description
-        uses: peter-evans/dockerhub-description@v2
+      - name: Update DockerHub description
+        uses: peter-evans/dockerhub-description@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_PASSWORD }}
-          repository: ${{ secrets.DOCKER_USERNAME }}/${{ github.event.repository.name }}
+          repository: ${{ secrets.DOCKER_USERNAME }}/${{ env.REPO_LC }}
           short-description: ${{ github.event.repository.description }}
 
       - name: Image digest
-        run: echo ${{ steps.docker_build.outputs.digest }}
+        run: echo "🐳 Digest ${{ steps.docker_build.outputs.digest }}"
+
+  # ─────────────────────────────────────────────────────────────
+  # STAGE 4: Notificación final con resumen completo
+  # ─────────────────────────────────────────────────────────────
+  notify_result:
+    name: 📨 Notificación Final
+    runs-on: ubuntu-latest
+    needs: [security, deploy]
+    if: always()
+
+    steps:
+      - name: Preparar mensaje Telegram
+        id: msg
+        run: |
+          # ── Estado seguridad ──────────────────────────────────
+          SEC_PASSED="${{ needs.security.outputs.security_passed }}"
+          if [ "$SEC_PASSED" = "true" ]; then
+            SEC_ICON="✅"
+            SEC_STATUS="Pasó (sin críticos)"
+          else
+            SEC_ICON="❌"
+            SEC_STATUS="FALLÓ (críticos detectados)"
+          fi
+
+          # ── Estado deploy ─────────────────────────────────────
+          DEPLOY_RESULT="${{ needs.deploy.result }}"
+          case "$DEPLOY_RESULT" in
+            success)  DEPLOY_ICON="✅"; DEPLOY_STATUS="Deployado correctamente" ;;
+            failure)  DEPLOY_ICON="❌"; DEPLOY_STATUS="Falló el deploy" ;;
+            skipped)  DEPLOY_ICON="⏭️"; DEPLOY_STATUS="Omitido (seguridad bloqueó o es PR)" ;;
+            *)        DEPLOY_ICON="❓"; DEPLOY_STATUS="Estado desconocido" ;;
+          esac
+
+          # ── Pipeline global ───────────────────────────────────
+          if [ "$SEC_PASSED" = "true" ] && [ "$DEPLOY_RESULT" = "success" ]; then
+            GLOBAL="✅ Pipeline completado exitosamente"
+          elif [ "$DEPLOY_RESULT" = "skipped" ] && [ "$SEC_PASSED" = "true" ]; then
+            GLOBAL="✅ Seguridad OK — Deploy omitido (PR o sin críticos)"
+          else
+            GLOBAL="❌ Pipeline con errores — revisión requerida"
+          fi
+
+          echo "sec_icon=$SEC_ICON"           >> $GITHUB_OUTPUT
+          echo "sec_status=$SEC_STATUS"       >> $GITHUB_OUTPUT
+          echo "deploy_icon=$DEPLOY_ICON"     >> $GITHUB_OUTPUT
+          echo "deploy_status=$DEPLOY_STATUS" >> $GITHUB_OUTPUT
+          echo "global=$GLOBAL"               >> $GITHUB_OUTPUT
+
+      - name: Notificar resultado a Telegram
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.NOTIFY_CHAT }}
+          token: ${{ secrets.NOTIFY_SIGNKEY }}
+          format: markdown
+          message: |
+            ${{ steps.msg.outputs.global }}
+
+            👤 *Actor:* ${{ github.actor }}
+            📦 *Repo:* ${{ github.repository }}
+            🌿 *Branch:* ${{ github.ref_name }}
+            🔗 *SHA:* `${{ github.sha }}`
+
+            ━━━━━━━━━━━━━━━━━━━━
+            🔒 *Seguridad*
+            ${{ steps.msg.outputs.sec_icon }} ${{ steps.msg.outputs.sec_status }}
+
+            📊 *Detalle de hallazgos:*
+            • Semgrep críticos: ${{ needs.security.outputs.semgrep_critical }} / total: ${{ needs.security.outputs.semgrep_total }}
+            • Secrets activos: ${{ needs.security.outputs.secrets_verified }} / total: ${{ needs.security.outputs.secrets_total }}
+            • Trivy críticos: ${{ needs.security.outputs.trivy_critical }} / total: ${{ needs.security.outputs.trivy_total }}
+
+            ━━━━━━━━━━━━━━━━━━━━
+            🐳 *Deploy DockerHub*
+            ${{ steps.msg.outputs.deploy_icon }} ${{ steps.msg.outputs.deploy_status }}
+
+            ━━━━━━━━━━━━━━━━━━━━
+            🕐 ${{ github.event.head_commit.timestamp }}
